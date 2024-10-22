@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: es-debug
+spec:
+  restartPolicy: Never
+  volumes:
+    - name: es-certs
+      secret:
+        secretName: es-certs
+  containers:
+    - name: debug
+      image: alpine
+      command:
+        ["sh", "-c", "trap 'exit' SIGTERM SIGINT; while true; do sleep 1; done"]
+      volumeMounts:
+        - name: es-certs
+          mountPath: /data/ca.crt
+          subPath: ca.crt
+        - name: es-certs
+          mountPath: /data/server.crt
+          subPath: server.crt
+        - name: es-certs
+          mountPath: /data/server.key
+          subPath: server.key

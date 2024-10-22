@@ -1,0 +1,139 @@
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: es
+spec:
+  serviceName: es-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: es
+  template:
+    metadata:
+      labels:
+        app: es
+    spec:
+      volumes:
+        - name: es-conf
+          emptyDir: {}
+        - name: es-certs
+          secret:
+            secretName: es-certs
+        - name: es-conf-template
+          configMap:
+            name: es-conf-template
+        # - name: es-keystore
+        #   persistentVolumeClaim:
+        #     claimName: es-keystore
+      initContainers:
+        - name: increase-vm-max-map
+          image: busybox
+          command: ["sysctl", "-w", "vm.max_map_count=262144"]
+          securityContext:
+            privileged: true
+        - name: increase-fd-ulimit
+          image: busybox
+          command: ["sh", "-c", "ulimit -n 65536"]
+          securityContext:
+            privileged: true
+        - name: chown-data
+          image: busybox
+          command: ["sh", "-c", "chown 1000:1000 /data/"]
+          volumeMounts:
+            - name: es-data
+              mountPath: /data
+        - name: set-node-name
+          image: busybox
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: es-conf-template
+              mountPath: /data/es-conf-template.yaml
+              subPath: es-conf-template.yaml
+            - name: es-conf
+              mountPath: /data/es-conf/
+          command:
+            - sh
+            - -c
+            - |
+              sed "s|{NODE_NAME}|$NODE_NAME.es-headless.default.svc.cluster.local|" /data/es-conf-template.yaml > /data/es-conf/es-conf.yaml
+      containers:
+        - name: es
+          image: elasticsearch:8.15.3
+          resources:
+            limits:
+              cpu: 500m
+              memory: 2000Mi
+            requests:
+              cpu: 250m
+              memory: 1000Mi
+          ports:
+            - containerPort: 9200
+              name: rest
+              protocol: TCP
+          volumeMounts:
+            - name: es-conf
+              mountPath: /usr/share/elasticsearch/config/elasticsearch.yml
+              subPath: es-conf.yaml
+            - name: es-certs
+              mountPath: /usr/share/elasticsearch/config/certificates/ca.crt
+              subPath: ca.crt
+            - name: es-certs
+              mountPath: /usr/share/elasticsearch/config/certificates/server.crt
+              subPath: server.crt
+            - name: es-certs
+              mountPath: /usr/share/elasticsearch/config/certificates/server.key
+              subPath: server.key
+            # - name: es-keystore
+            #   mountPath: /usr/share/elasticsearch/config/elasticsearch.keystore
+            #   subPath: elasticsearch.keystore
+            - name: es-data
+              mountPath: /usr/share/elasticsearch/data
+          env:
+            # - name: node.name
+            #   valueFrom:
+            #     fieldRef:
+            #       fieldPath: metadata.name
+            - name: ELASTIC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: es-bootstrap-password
+                  key: password
+            # - name: ES_JAVA_OPTS
+            #   value: "-Xms512m -Xmx1024m"
+  volumeClaimTemplates:
+    - metadata:
+        name: es-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: "standard-rwo"
+        resources:
+          requests:
+            storage: 5Gi
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: es-headless
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app: es
+  ports:
+    - port: 9200
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: es
+spec:
+  type: ClusterIP
+  selector:
+    app: es
+  ports:
+    - port: 9200
