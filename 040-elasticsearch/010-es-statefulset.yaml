@@ -14,12 +14,36 @@ spec:
       labels:
         app: es
     spec:
+      topologySpreadConstraints:
+        # spread accross zones
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: es
+        # avoid same nodes in one zone
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: es
+      affinity:
+        podAntiAffinity:
+          # maximum one pod per node
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - es
+              topologyKey: "kubernetes.io/hostname"
       volumes:
-        - name: es-conf
-          emptyDir: {}
-        - name: es-certs
+        - name: es-ca-certs
           secret:
-            secretName: es-certs
+            secretName: es-ca-certs
         - name: es-conf-template
           configMap:
             name: es-conf-template
@@ -28,76 +52,125 @@ spec:
         #     claimName: es-keystore
       initContainers:
         - name: increase-vm-max-map
-          image: busybox
+          image: alpine
           command: ["sysctl", "-w", "vm.max_map_count=262144"]
           securityContext:
             privileged: true
         - name: increase-fd-ulimit
-          image: busybox
+          image: alpine
           command: ["sh", "-c", "ulimit -n 65536"]
           securityContext:
             privileged: true
-        - name: chown-data
-          image: busybox
-          command: ["sh", "-c", "chown 1000:1000 /data/"]
+        - name: chown-workdir
+          image: alpine
+          command:
+            - "sh"
+            - "-c"
+            - |
+              chown 1000:1000 /workdir
+              mkdir -p /workdir/data
+              chown 1000:1000 /workdir/data
           volumeMounts:
-            - name: es-data
-              mountPath: /data
-        - name: set-node-name
-          image: busybox
+            - name: es-workdir
+              mountPath: /workdir
+        - name: prepare-certs
+          image: alpine
           env:
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           volumeMounts:
-            - name: es-conf-template
-              mountPath: /data/es-conf-template.yaml
-              subPath: es-conf-template.yaml
-            - name: es-conf
-              mountPath: /data/es-conf/
+            - name: es-workdir
+              mountPath: /workdir/
+            - name: es-ca-certs
+              mountPath: /ca-certs/
           command:
             - sh
             - -c
             - |
-              sed "s|{NODE_NAME}|$NODE_NAME.es-headless.default.svc.cluster.local|" /data/es-conf-template.yaml > /data/es-conf/es-conf.yaml
+              set -e
+
+              apk add openssl
+
+              mkdir -p /workdir/certs
+              cp /ca-certs/ca.crt /workdir/certs
+              SVC_NAME=es
+              HEADLESS_SVC_NAME=es-headless
+
+              org_name=tuana9a
+              country=VN
+              state=HN
+              ca_key=/ca-certs/ca.key
+              ca_crt=/workdir/certs/ca.crt
+              expire_days=${expire_days:-3650}
+              server_key=/workdir/certs/server.key
+              server_csr=/workdir/certs/server.csr
+              server_crt=/workdir/certs/server.crt
+
+              # $pod-name.$headless-service-name.$namespace.svc.cluster.local
+              SAN="DNS:$SVC_NAME.$POD_NAMESPACE.svc.cluster.local"
+              SAN="$SAN,DNS:$NODE_NAME.$HEADLESS_SVC_NAME.$POD_NAMESPACE.svc.cluster.local"
+
+              openssl genrsa -out $server_key 2048
+              openssl req -new -sha256 -subj "/C=$country/ST=$state/O=$org_name/CN=$org_name" -key $server_key -out $server_csr
+              openssl x509 -req -sha256 -days $expire_days -in $server_csr -CA $ca_crt -CAkey $ca_key -out $server_crt -extfile <(printf "subjectAltName=$SAN") -CAcreateserial
+
+              chown 1000:1000 -R /workdir/certs
+
+              ls -l /workdir/certs
+        - name: set-node-name
+          image: alpine
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          volumeMounts:
+            - name: es-conf-template
+              mountPath: /templates/es-conf-template.yaml
+              subPath: es-conf-template.yaml
+            - name: es-workdir
+              mountPath: /workdir/
+          command:
+            - sh
+            - -c
+            - |
+              HEADLESS_SVC_NAME=es-headless
+              sed "s|{NODE_NAME}|$NODE_NAME.$HEADLESS_SVC_NAME.$POD_NAMESPACE.svc.cluster.local|" /templates/es-conf-template.yaml > /workdir/elasticsearch.yml
       containers:
-        - name: es
+        - name: elasticsearch
           image: elasticsearch:8.15.3
           resources:
             limits:
-              cpu: 500m
-              memory: 2000Mi
+              cpu: 1000m
+              memory: 2500Mi
             requests:
               cpu: 250m
-              memory: 1000Mi
+              memory: 2000Mi
           ports:
             - containerPort: 9200
               name: rest
               protocol: TCP
           volumeMounts:
-            - name: es-conf
+            - name: es-workdir
               mountPath: /usr/share/elasticsearch/config/elasticsearch.yml
-              subPath: es-conf.yaml
-            - name: es-certs
-              mountPath: /usr/share/elasticsearch/config/certificates/ca.crt
-              subPath: ca.crt
-            - name: es-certs
-              mountPath: /usr/share/elasticsearch/config/certificates/server.crt
-              subPath: server.crt
-            - name: es-certs
-              mountPath: /usr/share/elasticsearch/config/certificates/server.key
-              subPath: server.key
-            # - name: es-keystore
-            #   mountPath: /usr/share/elasticsearch/config/elasticsearch.keystore
-            #   subPath: elasticsearch.keystore
-            - name: es-data
+              subPath: elasticsearch.yml
+            - name: es-workdir
+              mountPath: /usr/share/elasticsearch/config/certificates/
+              subPath: certs
+            - name: es-workdir
               mountPath: /usr/share/elasticsearch/data
+              subPath: data
           env:
-            # - name: node.name
-            #   valueFrom:
-            #     fieldRef:
-            #       fieldPath: metadata.name
             - name: ELASTIC_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -107,7 +180,7 @@ spec:
             #   value: "-Xms512m -Xmx1024m"
   volumeClaimTemplates:
     - metadata:
-        name: es-data
+        name: es-workdir
       spec:
         accessModes: ["ReadWriteOnce"]
         storageClassName: "standard-rwo"
@@ -118,7 +191,7 @@ spec:
 kind: Service
 apiVersion: v1
 metadata:
-  name: es-headless
+  name: es-headless # WARN: changing the svc name will break the ssl certs, so update value the HEADLESS_SVC_NAME env at init containers above!
 spec:
   type: ClusterIP
   clusterIP: None

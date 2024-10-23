@@ -5,21 +5,14 @@ metadata:
 spec:
   restartPolicy: Never
   volumes:
-    - name: es-certs
+    - name: es-ca-certs
       secret:
-        secretName: es-certs
+        secretName: es-ca-certs
   containers:
     - name: debug
       image: alpine
       command:
         ["sh", "-c", "trap 'exit' SIGTERM SIGINT; while true; do sleep 1; done"]
       volumeMounts:
-        - name: es-certs
-          mountPath: /data/ca.crt
-          subPath: ca.crt
-        - name: es-certs
-          mountPath: /data/server.crt
-          subPath: server.crt
-        - name: es-certs
-          mountPath: /data/server.key
-          subPath: server.key
+        - name: es-ca-certs
+          mountPath: /ca-certs
